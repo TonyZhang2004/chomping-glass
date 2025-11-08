@@ -3,7 +3,6 @@ name = "chomping-glass"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 crate-type = ["cdylib", "lib"]
 name = "chomping_glass"
@@ -24,3 +23,9 @@ overflow-checks = true
 [dependencies]
 solana-program = "=1.14.12"
 bytemuck = "=1.13.0"
+
+[workspace]
+members = [
+    "chomp-bot"
+]
+resolver = "2"
