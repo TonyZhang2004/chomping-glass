@@ -2,11 +2,18 @@
 name = "chomp-bot"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Baseline Chomp/Glass strategy client for Solana"
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+log = "0.4"
+env_logger = "0.11"
+
+# Match your program’s Solana version
 solana-client = "=1.14.12"
 solana-sdk    = "=1.14.12"
 
-# Force-enable std on console (pulled in via indicatif)
+# Force-enable the `std` feature on `console` used by `indicatif`
 console   = { version = "0.16.1", features = ["std"] }
-indicatif = { version = "0.16.2", default-features = true }

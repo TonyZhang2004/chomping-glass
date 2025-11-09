@@ -24,8 +24,9 @@ overflow-checks = true
 solana-program = "=1.14.12"
 bytemuck = "=1.13.0"
 
+# This file is BOTH your program package manifest and the workspace root.
 [workspace]
 members = [
-    "chomp-bot"
+    "chomp-bot",   # include ONLY the Rust client
 ]
 resolver = "2"
