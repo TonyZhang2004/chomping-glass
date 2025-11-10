@@ -1,23 +1,38 @@
 # Technical Write-Up
 
 ## Architecture Overview
-The bot is split into three small crates modules: `config` owns CLI/env surfaces, `solana` wraps all RPC + PDA instructions, and `game` exposes pure move-generation utilities. This separation keeps networking, key-management, and solver logic decoupled, letting us unit-test the solver without touching Solana and swap out transport pieces (e.g., using a prioritized RPC) without rewriting game logic. The `main` loop orchestrates configuration, memoized solver state, and the execution mode (single move vs. autoplay), which keeps stateful concerns localized and traceable in logs.
+The crate is organized around three modules:
 
-## Most Challenging Technical Aspects
-Interfacing a local machine with the on-chain program was the trickiest part: we must derive the PDA deterministically, fetch its serialized board state, and mutate it via a move instruction, all while dealing with RPC rate limits and eventual consistency. The client needs to keep signing keys safe locally, yet stream moves fast enough to keep up with on-chain opponents. Error handling is nuanced—missing PDAs, partially confirmed cash-outs, or serialization mismatches can all cause desync, so the code polls for closure after resets and double-checks fetched data shapes before trusting a board snapshot.
+- `config`: parses CLI flags + env vars (powered by `clap`) and normalizes defaults.
+- `solana`: derives the PDA, fetches the 5-byte board state, submits signed instructions, and exposes helpers for “cash out”/reset flows.
+- `game`: contains the pure strategy engine (`PositionTable`, `Skyline`, `pick_forced_victory`, etc.).
 
-## Problem-Solving Approach
-1. Recreate the minimal Solana interaction surface (PDA derivation, board fetch, transaction send) and validate it against the live program.
-2. Build a deterministic board representation that matches the on-chain format, then implement pure solver logic over it.
-3. Layer configuration (CLI/env) and control flow (single move vs. autoplay) on top, keeping logging and memoization optional but well-scoped.
-4. Iterate with end-to-end dry runs against a dev cluster to verify transaction lifecycles and solver choices.
+`main.rs` glues everything together by configuring logging, loading the player keypair, then dispatching to either `run_single_move` or `run_autoplay`. This separation lets us unit-test the solver without touching RPC, while keeping all side effects (network + signing) inside the `solana` module.
 
-## Strategy Overview
-The solver performs a DFS with memoization over the 5x8 Chomp board, flagging “winning” boards and returning the first move that leads the opponent into a losing state; autoplay falls back to any legal move when the solver cannot find a forced win (e.g., when the board is already poisoned). Because opponents—including AI agents—may deviate from optimal play or mirror our strategy, we cannot guarantee victory against a perfectly optimal adversary; the bot merely maximizes the chance of forcing a loss when such a state exists.
+## Technical Challenges
 
-## Strengthening the Strategy
-- Integrate opponent modeling to detect non-optimal patterns and bias the solver toward lines that exploit those tendencies.
-- Add Monte Carlo or minimax rollouts with heuristic pruning to explore deeper future states when memoized data is sparse.
+1. **Interacting with the on-chain program reliably** – All Solana calls live in `solana.rs`, which derives the PDA (`Pubkey::find_program_address`), fetches the five-byte board (`rpc.get_account`), and builds the single-byte instruction `[(row << 4) | col]`. Cash-outs reuse the same instruction with `(0,0)` and the client polls the PDA every 500 ms until it disappears so we never reuse a stale account. Every transaction signature is logged, giving us a Solscan trail and quick feedback if the chain rejects a move. Exposing `--interval_ms`, `--max_moves`, and `--init_if_missing` lets operators tune write pressure and decide whether to bootstrap a new PDA automatically.
+2. **Figuring out a deterministic lookup-table strategy** – Rather than run DFS + memoization every move, we encode each board into a “skyline” and pack it into a 16-bit index. `PositionTable::new()` performs a single DFS over all 5 × 8 boards at startup, labeling each index as `Winning(row, col)` or `Losing`. At runtime `pick_forced_victory` simply replays the stored coordinates while `pick_any_legal` handles losing states. This turns move selection into an O(1) table lookup, survives process restarts, and guarantees the same response for a given board.
+
+## Strategy Details
+
+1. Encode each 5 × 8 board as a monotonic “skyline”: how many candies remain per row from left to right.
+2. Map that skyline to a compact 16-bit index (the `Skyline::encode` bit-packing step).
+3. During build, lazily populate `PositionTable.book` by DFS’ing the entire game tree once. Each state is marked as:
+   - `Classified::Winning(r, c)` if there exists a move forcing the opponent into a Losing state.
+   - `Classified::Losing` when every move hands the advantage to the opponent.
+4. At runtime, `pick_forced_victory` simply looks up the encoded skyline and replays the stored `(row, col)` (converted back to human 1-indexed coordinates). When no forced win exists, `pick_any_legal` returns the first legal square, prioritizing non-poison moves.
+
+Because the glass sits in the bottom-right corner and moves eat upward/leftward, this perspective flip lets the solver reuse the same bitmasks the program stores on-chain—no translation layer needed.
+
+## Operating the Bot
+
+- **Single move:** `cargo run -p chomp-bot -- --rpc <URL> --program <ID> --collector <FEE>`
+- **Autoplay:** `cargo run -p chomp-bot -- --autoplay --interval_ms 2000`
+- **Reset then autoplay:** `cargo run -p chomp-bot -- --reset --autoplay`
+
+Every invocation prints the latest board (binary rows), the move coordinates, and the resulting transaction signature so you can verify it on Solscan. If only the poisonous square remains, the loop stops with “Only glass remains — game over.”
 
 ## AI Disclosure
-I collaborated with Codex (powered by GPT-5) to implement my original project sketch, refine the Solana integration, and debug RPC/solver edge cases. I guided the work, monitored code generation and documentation under assistance with Codex.
+
+I collaborated with Codex (powered by GPT‑5) for code implementation, refactors, and documentation polish. All Solana credentials, testing, and deployment decisions were performed manually. I reviewed every change, supplied strategy requirements, and validated that the final implementation matched my design.

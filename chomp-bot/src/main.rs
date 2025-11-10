@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use env_logger::Env;
-use log::{error, info, warn};
+use log::{info, warn};
 
 mod config;
 mod solana;
@@ -8,10 +8,10 @@ mod game;
 
 use crate::config::Cli;
 use crate::solana::{fetch_board, get_game_pda, reset_game_pda, send_move};
-use crate::game::{choose_any_safe, choose_move_solver, is_terminal_poison};
+use crate::game::{pick_any_legal, pick_forced_victory, is_glass_only};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, signature::{read_keypair_file, Keypair}, signer::Signer};
-use std::{collections::HashMap, thread, time::Duration};
+use std::{thread, time::Duration};
 use clap::Parser;
 
 fn main() -> Result<()> {
@@ -31,11 +31,10 @@ let payer: Keypair = read_keypair_file(&payer_path)
         reset_game_pda(&rpc, &program_id, &fee_collector, &payer, &game_pda)?;
     }
 
-    let mut memo: HashMap<[u8; 5], (bool, Option<(u8, u8)>)> = HashMap::new();
     if cli.autoplay {
-        run_autoplay(&rpc, &program_id, &fee_collector, &payer, &game_pda, &cli, &mut memo)?;
+        run_autoplay(&rpc, &program_id, &fee_collector, &payer, &game_pda, &cli)?;
     } else {
-        run_single_move(&rpc, &program_id, &fee_collector, &payer, &game_pda, &cli, &mut memo)?;
+        run_single_move(&rpc, &program_id, &fee_collector, &payer, &game_pda, &cli)?;
     }
     Ok(())
 }
@@ -47,7 +46,6 @@ fn run_autoplay(
     payer: &Keypair,
     game_pda: &Pubkey,
     cli: &Cli,
-    memo: &mut HashMap<[u8; 5], (bool, Option<(u8, u8)>)>,
 ) -> Result<()> {
     info!(
         "Autoplay ON (interval={}ms, max_moves={}, last_move_wins={}, reset={}, init_if_missing={})",
@@ -59,13 +57,13 @@ fn run_autoplay(
         match fetch_board(rpc, game_pda)? {
             Some(board) => {
                 print_board("board", &board);
-                if is_terminal_poison(board) {
+                if is_glass_only(board) {
                     info!("Only glass remains — game over.");
                     break;
                 }
 
-                let (r, c) = choose_move_solver(board, memo)
-                    .or_else(|| choose_any_safe(board))
+                let (r, c) = pick_forced_victory(board)
+                    .or_else(|| pick_any_legal(board))
                     .unwrap_or((0, 0));
                 info!("chosen: ({},{})", r, c);
                 if r == 0 && c == 0 {
@@ -88,8 +86,8 @@ fn run_autoplay(
                 }
                 info!("No PDA found — starting a NEW game by making the first move.");
                 let empty = [0u8; 5];
-                let (r, c) = choose_move_solver(empty, memo)
-                    .or_else(|| choose_any_safe(empty))
+                let (r, c) = pick_forced_victory(empty)
+                    .or_else(|| pick_any_legal(empty))
                     .unwrap_or((5, 1));
                 info!("opening: ({},{})", r, c);
                 send_move(rpc, program_id, fee_collector, payer, game_pda, r, c)?;
@@ -113,12 +111,11 @@ fn run_single_move(
     payer: &Keypair,
     game_pda: &Pubkey,
     cli: &Cli,
-    memo: &mut HashMap<[u8; 5], (bool, Option<(u8, u8)>)>,
 ) -> Result<()> {
     match fetch_board(rpc, game_pda)? {
         Some(board) => {
             print_board("current", &board);
-            if is_terminal_poison(board) {
+            if is_glass_only(board) {
                 info!("Only glass remains — game ended.");
                 return Ok(());
             }
@@ -128,8 +125,8 @@ fn run_single_move(
             } else if let (Some(r), Some(c)) = (cli.row, cli.col) {
                 (r, c)
             } else {
-                choose_move_solver(board, memo)
-                    .or_else(|| choose_any_safe(board))
+                pick_forced_victory(board)
+                    .or_else(|| pick_any_legal(board))
                     .unwrap_or((0, 0))
             };
 
@@ -153,8 +150,8 @@ fn run_single_move(
             }
             info!("No PDA found — starting NEW game.");
             let empty = [0u8; 5];
-            let (r, c) = choose_move_solver(empty, memo)
-                .or_else(|| choose_any_safe(empty))
+            let (r, c) = pick_forced_victory(empty)
+                .or_else(|| pick_any_legal(empty))
                 .unwrap_or((5, 1));
             info!("opening: ({},{})", r, c);
             send_move(rpc, program_id, fee_collector, payer, game_pda, r, c)?;

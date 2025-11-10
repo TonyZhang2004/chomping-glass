@@ -1,84 +1,66 @@
 # chomp-bot
 
-A production-ready command-line bot that plays Solana “Chomp/Glass” by monitoring the per-player PDA, computing an optimal (or at least safe) move, and submitting the transaction on your behalf. The tool can either fire a single move on demand or run indefinitely in autoplay mode with optional PDA reset/re-init flows.
+`chomp-bot` is Tony Zhang's submission for Chomping Glass. It watches your PDA, consults a lookup table precomputed through DFS to pick a winning move when one exists, and submits the transaction. You can fire a single move on demand or let it autoplay until the game ends.
 
-## Prerequisites
-- **Rust** 1.74+ with `cargo` (install via [rustup](https://rustup.rs/)).
-- **Solana toolchain** that matches the on-chain program this client talks to. The crate pins `solana-client`/`solana-sdk` to `1.14.12`, so install `solana-cli 1.14.12` if you need to inspect accounts or manage keypairs locally.
-- **Keypair** that will pay fees and own the PDA (default: `~/.config/solana/id.json`).
-- **RPC endpoint** with write access to the cluster you want to play on (mainnet-beta by default).
+## Quick start
 
-## Setup
-```bash
-# From the repo root
-cargo build -p chomp-bot --release
-
-# Verify everything compiles and solver tests pass
-cargo test -p chomp-bot
-```
-
-Set the program and fee collector once in your shell profile (or export them before running):
 ```bash
 export PROGRAM_ID=ChompZg47TcVy5fk2LxPEpW6SytFYBES5SHoqgrm8A4D
 export FEE_COLLECTOR=EGJnqcxVbhJFJ6Xnchtaw8jmPSvoLXfN2gWsY9Etz5SZ
+
+# Compile and run unit tests
+cargo test -p chomp-bot
+
+# Inspect flags
+cargo run -p chomp-bot -- --help
 ```
 
-## Configuration
-All runtime settings are exposed as CLI flags (and some have env fallbacks). Run `cargo run -p chomp-bot -- --help` for the full list. The most important switches:
+## Common commands
 
-| Flag / Env             | Purpose                                                                 | Default                                  |
-|------------------------|-------------------------------------------------------------------------|------------------------------------------|
-| `--rpc <URL>`          | Solana RPC endpoint                                                     | `https://api.mainnet-beta.solana.com`    |
-| `--keypair <PATH>`     | Fee payer/player keypair                                                | `~/.config/solana/id.json`               |
-| `--program <PUBKEY>`   | Game program ID (`PROGRAM_ID` env)                                      | `ChompZg47…`                             |
-| `--collector <PUBKEY>` | Fee collector account (`FEE_COLLECTOR` env)                             | `EGJnqcxV…`                              |
-| `--autoplay`           | Loop forever, submitting moves on interval                              | `false`                                  |
-| `--interval_ms <u64>`  | Sleep between autoplay moves                                            | `1500`                                   |
-| `--max_moves <u32>`    | Stop autoplay after N moves                                             | `200`                                    |
-| `--init_if_missing`    | Create a PDA automatically if one is missing                            | `true`                                   |
-| `--reset`              | Cash-out (0,0) to close the PDA before starting                         | `false`                                  |
-| `--r/--c <u8>`         | Force a manual move (row/column) in single-move mode                    | `None`                                   |
-| `--cash_out`           | Send `(0,0)` immediately to exit the game                               | `false`                                  |
-| `RUST_LOG=<level>`     | Log verbosity (handled by `env_logger`)                                 | `info`                                   |
+| Command | Description |
+| --- | --- |
+| `cargo run -p chomp-bot --` | Submit a single optimal move (falls back to any legal move). |
+| `cargo run -p chomp-bot -- --autoplay --interval_ms 2000` | Loop forever, taking a move every 2s. |
+| `cargo run -p chomp-bot -- --cash_out` | Immediately send `(0,0)` to close the PDA. |
+| `cargo run -p chomp-bot -- --reset --autoplay` | Reset the PDA, wait for closure, then autoplay from a clean board. |
 
-The solver memoizes explored boards in-memory, so long-running autoplay sessions should be started as a single process to benefit from the cache.
+Important flags (see `--help` for the full list):
 
-## Running
+- `--rpc <URL>`: RPC endpoint (default `https://api.mainnet-beta.solana.com`)
+- `--keypair <PATH>`: signer JSON file
+- `--program` / `--collector`: override the program and fee collector pubkeys
+- `--interval_ms`, `--max_moves`, `--init_if_missing`, `--last_move_wins`, `--cash_out`
+- `--r` / `--c`: force a manual move in single-shot mode
 
-### Single move
-```bash
-cargo run -p chomp-bot -- \
-  --rpc https://api.mainnet-beta.solana.com \
-  --keypair ~/.config/solana/id.json \
-  --program $PROGRAM_ID \
-  --collector $FEE_COLLECTOR
-```
-- If `--r`/`--c` are omitted, the solver selects a safe move.  
-- Include `--cash_out` to send `(0,0)` and close the PDA.  
-- Use `--init_if_missing=false` if you only want to act when a board already exists.
+## Strategy overview
 
-### Autoplay
-```bash
-cargo run -p chomp-bot -- \
-  --autoplay \
-  --interval_ms 2000 \
-  --max_moves 500 \
-  --rpc https://api.mainnet-beta.solana.com
-```
-The loop reads the PDA, prints a bitwise board view, chooses a move (falling back to any legal move if needed), and submits the transaction. It stops when:
-- The board reaches the terminal “glass only” state.
-- No safe move exists.
-- `--max_moves` is hit.
-- The PDA disappears and `--init_if_missing=false`.
+The bot encodes each board as a “skyline” describing how many candies remain per row. That skyline is mapped into a 16‑bit index, which we use to address a `TABLE_SIZE = 65,536` array named `PositionTable`. Every entry is classified as:
 
-### Resetting the PDA
-Passing `--reset` issues a `(0,0)` “cash-out” move, waits for the PDA to close, and only then proceeds. This is useful when testing new strategies from a known empty board.
+- `Winning(row, col)`: there exists a move that forces the opponent into a losing state. The stored `(row, col)` is replayed during the game (converted back to 1-indexed coordinates).
+- `Losing`: any move hands the advantage to the opponent.
+
+When you run the CLI, it:
+
+1. Fetches the PDA and prints the board row masks.
+2. Checks whether only glass remains (`is_glass_only`).
+3. Asks `pick_forced_victory` for the stored reply; if none exists, it falls back to `pick_any_legal`.
+4. Builds and sends the on-chain instruction, logging the signature so you can verify the win on Solscan.
+
+Because the lookup table is deterministic and lives in-process via `once_cell::sync::Lazy`, subsequent moves are instantaneous—no recursion or memo maps at runtime.
 
 ## Troubleshooting
-- Ensure your keypair has enough SOL to cover compute units and the PDA rent.  
-- RPC providers may throttle frequent writes; increase `--interval_ms` if you see `429`/`rate limit` errors.  
-- Enable debug logs with `RUST_LOG=debug` to trace solver decisions and PDA polling.  
-- If the PDA data layout changes on-chain, update `fetch_board` to match the new serialization before running against that program.
 
-## Testing & CI
-`cargo test -p chomp-bot` exercises the recursive solver and ensures the terminal board is handled correctly. Integrate the crate into your CI by running `cargo fmt --check`, `cargo clippy -- -D warnings`, and the tests mentioned above to guard future changes.
+- Run with `RUST_LOG=debug` to print PDA polling and move-selection details.
+- Increase `--interval_ms` if your RPC endpoint throttles (`429`) during autoplay.
+- If you see `No PDA found` unexpectedly, ensure your keypair has SOL to pay rent or pass `--init_if_missing=false` to stop when the account disappears.
+- Anytime the on-chain layout changes, adjust `fetch_board` to match the new serialization before running the bot.
+
+## Testing
+
+`cargo test -p chomp-bot` verifies:
+
+- the skyline ↔ bitmask encoding
+- the forced-victory solver
+- the fallback rectangle fill logic
+
+Integrate this crate in CI by running `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test -p chomp-bot`.
